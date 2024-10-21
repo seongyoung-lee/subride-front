@@ -9,7 +9,7 @@ USE_ARGOCD=true
 
 # ArgoCD 이용 시 
 GIT_ACCESS_CREDENTIAL=github_access_token_user29
-MANIFEST_REPO=github.com/leesy14/subrecommend-manifest.git
+MANIFEST_REPO=github.com/seongyoung-lee/subrecommend-manifest.git
 MANIFEST_REPO_DIR=subrecommend-manifest
 MANIFEST_DIR=manifest
 
@@ -20,7 +20,7 @@ REPLICAS=2
 SERVICE_ACCOUNT=sa-user29
 IMAGE_PULL_SECRET=dockerhub  
 IMAGE_REG_HOST=docker.io
-IMAGE_REG_ORG=leesy14
+IMAGE_REG_ORG=seongyoung-lee
 IMAGE_PULL_POLICY=Always
 CPU_REQUEST=256m
 MEMORY_REQUEST=256Mi
