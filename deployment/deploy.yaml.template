@@ -1,0 +1,116 @@
+# deploy.yaml.template
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${APP_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${APP_NAME}
+spec:
+  selector:
+    matchLabels:
+      app: ${APP_NAME}
+  replicas: ${REPLICAS}
+  template:
+    metadata:
+      name: ${APP_NAME}
+      labels:
+        app: ${APP_NAME}
+    spec:
+      serviceAccount: ${SERVICE_ACCOUNT}
+      imagePullSecrets:
+        - name: ${IMAGE_PULL_SECRET}
+      containers:
+        - name: ${APP_NAME}
+          image: ${IMAGE_REG_HOST}/${IMAGE_REG_ORG}/${APP_NAME}:${IMAGE_TAG}
+          imagePullPolicy: ${IMAGE_PULL_POLICY}
+          envFrom:
+          - configMapRef:
+              name: ${APP_NAME}
+          - secretRef:
+              name: ${APP_NAME}
+          ports:
+            - name: container-port
+              containerPort: ${SERVICE_PORT}
+          resources:
+            requests:
+              cpu: ${CPU_REQUEST}
+              memory: ${MEMORY_REQUEST}
+            limits:
+              cpu: ${CPU_LIMIT}
+              memory: ${MEMORY_LIMIT}
+          startupProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  curl -s -f -o /dev/null ${EUREKA_URL}
+            initialDelaySeconds: ${STARTUP_DELAY} 
+            failureThreshold: ${STARTUP_FAILURE_THRESHOLD}
+            periodSeconds: ${STARTUP_PERIOD}
+          readinessProbe:
+            httpGet:
+              path: ${READINESS_PATH}
+              port: ${SERVICE_PORT}
+              scheme: ${READINESS_SCHEME}
+            periodSeconds: ${READINESS_PERIOD}
+            failureThreshold: ${READINESS_FAILURE_THRESHOLD} 
+          livenessProbe:
+            httpGet:
+              path: ${LIVENESS_PATH}
+              port: ${SERVICE_PORT}
+              scheme: ${LIVENESS_SCHEME}  
+            periodSeconds: ${LIVENESS_PERIOD}
+            failureThreshold: ${LIVENESS_FAILURE_THRESHOLD}
+---
+kind: ConfigMap 
+apiVersion: v1
+metadata:
+  name: ${APP_NAME}
+  namespace: ${NAMESPACE}  
+data:
+  TOKEN_REQUEST_INTERVAL: "${TOKEN_REQUEST_INTERVAL}"
+  IDLE_TIME: "${IDLE_TIME}"
+---
+kind: Secret
+apiVersion: v1  
+metadata:
+  name: ${APP_NAME}
+  namespace: ${NAMESPACE}
+type: Opaque
+stringData:
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${APP_NAME} 
+  namespace: ${NAMESPACE}
+spec:
+  type: ${SERVICE_TYPE}
+  selector:
+    app: ${APP_NAME}
+  ports:
+    - name: ${APP_NAME}
+      port: ${SERVICE_PORT}  
+      targetPort: ${SERVICE_PORT}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress  
+metadata:
+  name: ${APP_NAME}
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "${SSL_REDIRECT}"
+spec:
+  ingressClassName: ${INGRESS_CLASS} 
+  rules:
+    - host: ${INGRESS_HOST}
+      http:
+        paths:
+          - path: ${INGRESS_PATH}
+            pathType: ${INGRESS_PATH_TYPE}
+            backend:
+              service:
+                name: ${APP_NAME}
+                port:
+                  number: ${SERVICE_PORT}

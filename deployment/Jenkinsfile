@@ -1,0 +1,245 @@
+@Library('pipeline_shared_library') _
+def commonFunctions = commonFunctions(this)
+
+def SERVICE_ID = "subride-front"
+def PIPELINE_ID = "${SERVICE_ID}-${env.BUILD_NUMBER}"
+
+//=== 사전 준비 작업 ==
+podTemplate(
+    label: "${PIPELINE_ID}",
+    containers: [
+        containerTemplate(name: 'ssh', image: 'kroniak/ssh-client', command: 'cat', ttyEnabled: true),
+    ]
+)
+{
+    //-- NFS 공유 볼륨 디렉토리 생성
+    node("${PIPELINE_ID}") {
+        stage("Prepare Cache Volumes") {
+            container("ssh") {
+                withCredentials([sshUserPrivateKey(credentialsId: "${NFS_CREDENTIAL}", keyFileVariable: 'SSH_KEY_FILE', usernameVariable: 'SSH_USER')]) {
+                    sh """
+                        mkdir -p ~/.ssh
+                        ssh-keyscan -H ${NFS_HOST} >> ~/.ssh/known_hosts
+                        
+                        ssh -i ${SSH_KEY_FILE} ${SSH_USER}@${NFS_HOST} "sudo mkdir -p /${NFS_DIR}/${TRIVY_CACHE_DIR}/${SERVICE_ID}"
+                        
+                    """
+                }
+            }
+        }
+    }
+}
+
+//=== Build, Release, Run ======
+podTemplate(
+    label: "${PIPELINE_ID}",
+    containers: [
+        containerTemplate(name: "trivy", image: "aquasec/trivy", ttyEnabled: true, command: "cat"),
+        containerTemplate(name: "kubectl", image: "lachlanevenson/k8s-kubectl", command: "cat", ttyEnabled: true),
+        containerTemplate(name: "node", image: "node:22.2.0-alpine3.20", ttyEnabled: true, command: "cat"),
+        containerTemplate(name: 'sonar-scanner', image: 'sonarsource/sonar-scanner-cli', ttyEnabled: true, command: 'cat'),
+        containerTemplate(name: 'podman', image: "mgoltzsche/podman", ttyEnabled: true, command: 'cat', privileged: true),
+        containerTemplate(name: 'envsubst', image: "hiondal/envsubst", command: 'sleep', args: '1h')
+    ],
+    volumes: [
+        nfsVolume(mountPath: "/${TRIVY_CACHE_DIR}", serverAddress: "${NFS_HOST}", serverPath: "/${NFS_DIR}/${TRIVY_CACHE_DIR}/${SERVICE_ID}", readOnly: false),
+        //nfsVolume(mountPath: "/etc/containers/registries.conf.d", serverAddress: "${NFS_HOST}", serverPath: "/${NFS_DIR}/registries.conf.d", readOnly: true)
+    ]
+)
+{
+    node("${PIPELINE_ID}") {
+        stage("Get Source") {
+            checkout scm
+        }
+
+        commonFunctions.notifySlack("STARTED", "#FFFF00")
+
+        BASEDIR = "./deployment"
+        def props = readProperties  file:"${BASEDIR}/deploy_env_vars"
+        APP_NAME =              props["APP_NAME"]
+        IMAGE_REG_HOST =        props["IMAGE_REG_HOST"]
+        IMAGE_REG_ORG =         props["IMAGE_REG_ORG"]
+        IMAGE_TAG =             commonFunctions.getImageTag()
+        NAMESPACE =             props["NAMESPACE"]
+        IMAGE_REG_CREDENTIAL =  props["IMAGE_REG_CREDENTIAL"]
+        MANIFEST_FILENAME =     props["MANIFEST_FILENAME"]
+        IMAGE_SCAN_SEVERITY =   props["IMAGE_SCAN_SEVERITY"]
+        API_GATEWAY_FQDN =      props["API_GATEWAY_FQDN"]
+        IMAGE_MANIFEST_DIR =    props["IMAGE_MANIFEST_DIR"]
+        PROJECT_DIR =           props["PROJECT_DIR"]
+        SERVICE_PORT =          props["SERVICE_PORT"]
+        USE_ARGOCD =            props["USE_ARGOCD"]
+        
+        def IMAGE_PATH = "${IMAGE_REG_HOST}/${IMAGE_REG_ORG}/${APP_NAME}"
+
+        //-- ArgoCD 연동 시에만 필요 
+        MANIFEST_REPO =         props["MANIFEST_REPO"]
+        MANIFEST_REPO_DIR =     props["MANIFEST_REPO_DIR"]
+        MANIFEST_DIR =          props["MANIFEST_DIR"]
+        GIT_ACCESS_CREDENTIAL = props["GIT_ACCESS_CREDENTIAL"]
+
+        //-- 개발 시 CI/CD를 빠르게 하기 위해 일부 Stage Skip(sonar,trivy)
+        def skipStages = ""
+
+        try {
+
+            if(!skipStages.contains("sona")) {
+                stage("Build React Scripts") {
+                    container("node") {
+                        sh """
+                            npm ci --only=production
+                            npm run build --watch --watch-options-aggregate-timeout 1000
+                        """
+                    }
+                }
+
+                stage("SonarQube Analysis") {
+                    container("sonar-scanner") {
+                        //--Jenkins System설정과 sonar-project.properties파일 내용을 기반으로 소스검사 수행 
+                        withSonarQubeEnv("${SONAR_SERVER_ID}") {
+                            sh """
+                                sonar-scanner
+                            """
+                        }
+                    }
+                }
+            
+                stage("SonarQube Quality Gate") {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        def qg = waitForQualityGate()
+                        if (qg.status != 'OK') {
+                            echo "SonarQube Quality Gate failed. Aborting the pipeline."
+                            currentBuild.result = 'FAILURE'
+                            commonFunctions.notifySlack("SonarQube Quality Gate failed.", "#FF0000")
+                            error "Pipeline aborted due to SonarQube Quality Gate failure: ${qg.status}"
+                        }
+                    }
+                }
+            } 
+
+            stage("Build Container image") {
+                container("podman") {
+                    sh """
+                        podman build -f ${IMAGE_MANIFEST_DIR}/Dockerfile_react_express \
+                        -t ${IMAGE_PATH}:${IMAGE_TAG} \
+                        --build-arg PROJECT_FOLDER=${PROJECT_DIR} \
+                        --build-arg BUILD_FOLDER=${IMAGE_MANIFEST_DIR} \
+                        --build-arg EXPORT_PORT=${SERVICE_PORT} \
+                        --build-arg REACT_APP_API_BASE_URL=${API_GATEWAY_FQDN} \
+                        ${PROJECT_DIR}
+                    """
+                }
+            }
+
+            stage("Release Container image") {
+                container("podman") {
+                    withCredentials([usernamePassword(
+                        credentialsId: "${IMAGE_REG_CREDENTIAL}",
+                        usernameVariable: 'USERNAME',
+                        passwordVariable: 'PASSWORD'
+                    )]) {
+                        sh """
+                            echo user "$USERNAME" pasword "$PASSWORD"
+                            podman login ${IMAGE_REG_HOST} --username ${USERNAME} --password ${PASSWORD}
+
+                            podman push ${IMAGE_PATH}:${IMAGE_TAG}
+                        """
+                    }
+                }
+            }  
+
+            if(!skipStages.contains("trivy")) {
+                stage("Scan Image Vulnerability") {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        container("trivy") {
+
+                            def trivyOutput = sh (
+                                script: """
+                                    trivy image \
+                                        --cache-dir /${TRIVY_CACHE_DIR} \
+                                        --scanners vuln \
+                                        --severity ${IMAGE_SCAN_SEVERITY} \
+                                        --exit-code 0 \
+                                        ${IMAGE_PATH}:${IMAGE_TAG}
+                                """,
+                                returnStdout: true
+                            ).trim()
+
+                            echo "Trivy scan results:"
+                            echo trivyOutput
+
+                            def vulnerabilityCounts = commonFunctions.getVulnerabilityResult(trivyOutput)
+
+                            if (vulnerabilityCounts["CRITICAL"] > 0) {
+                                echo "Critical vulnerabilities found. Aborting the pipeline."
+                                commonFunctions.notifySlack("Vulnerability scan failed.", "#FF0000")
+                                
+                                //--통지만 하고 계속 진행
+                                //currentBuild.result = 'FAILURE'
+                                //error "Critical vulnerabilities found."
+                            } else {
+                                echo "No critical vulnerabilities found. Continuing the pipeline."
+                            }
+                        }
+                    }
+                }
+            }
+
+            stage( "Generate deployment yaml" ) {
+                container("envsubst") {
+                    sh """
+                        set -a
+                        source ${BASEDIR}/deploy_env_vars
+                        set +a
+
+                        export IMAGE_TAG=${IMAGE_TAG}
+
+                        envsubst < ${BASEDIR}/deploy.yaml.template > ${BASEDIR}/${MANIFEST_FILENAME}
+                        cat ${BASEDIR}/${MANIFEST_FILENAME}
+                    """
+                }
+            }
+
+            if("${USE_ARGOCD}" == "true") {
+                stage("Update manifest") {
+                    withCredentials([usernamePassword(credentialsId: "${GIT_ACCESS_CREDENTIAL}", usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_TOKEN')]) {
+                        sh "git clone https://${GIT_USERNAME}:${GIT_TOKEN}@${MANIFEST_REPO}"
+
+                        sh "mkdir -p ${MANIFEST_REPO_DIR}/${MANIFEST_DIR}"
+                        sh "cp -f ${BASEDIR}/${MANIFEST_FILENAME} ${MANIFEST_REPO_DIR}/${MANIFEST_DIR}/${MANIFEST_FILENAME}"
+
+                        dir("${MANIFEST_REPO_DIR}") {
+                            try {
+                                sh """
+                                    git checkout -B main
+                                    git config user.email "jenkins@gmail.com"
+                                    git config user.name "Jenkins"
+                                    git add ${MANIFEST_DIR}/${MANIFEST_FILENAME}
+                                    git commit -m "Update ${MANIFEST_DIR}/${MANIFEST_FILENAME}"
+                                    git push https://${GIT_USERNAME}:${GIT_TOKEN}@${MANIFEST_REPO} HEAD:main
+                                """
+                            } catch (e) {
+                                echo "Error occurred while push Deploy yaml. but keep going: ${e}"
+                            }
+                        }
+
+                    }
+                }           
+
+            } else {
+                stage( "Deploy to Cluster" ) {
+                    container("kubectl") {
+                        sh "kubectl apply -f ${BASEDIR}/${MANIFEST_FILENAME} -n ${NAMESPACE}"
+                    }
+                }
+            }
+
+            commonFunctions.notifySlack("${currentBuild.currentResult}", "#00FF00")
+            echo "**** FINISH ALL STAGES : SUCCESS"
+        } catch(e) {
+            currentBuild.result = "FAILED"
+            echo "Error occurred: ${e}"
+            commonFunctions.notifySlack("${currentBuild.currentResult}", "#FF0000")
+        }
+    }
+}
